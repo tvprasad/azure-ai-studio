@@ -1,13 +1,18 @@
 """
-Azure AI Studio
+Azure AI Studio v0.4.0
 Enterprise-ready Streamlit integration for Azure Cognitive Services.
 
-Architectural Improvements:
-- Service abstraction layer
-- Retry & timeout handling
-- Structured telemetry
-- Caching
-- Diagnostics panel
+Services:
+- Language Intelligence (Sentiment, Entities, Key Phrases, Language Detection)
+- Vision Intelligence (Image Analysis, Tagging, OCR)
+- Speech Services (Speech-to-Text, Text-to-Speech)
+- Document Intelligence (Prebuilt-read extraction)
+
+Architecture:
+- Shared AzureBaseClient with retry, timeout, and structured telemetry
+- Per-service clients: Language, Vision, Speech, DocIntel
+- Caching layer via st.cache_data
+- Sidebar diagnostics panel
 """
 
 import streamlit as st
@@ -37,6 +42,10 @@ API_KEY = st.secrets["AZURE_LANGUAGE_KEY"]
 VISION_ENDPOINT = st.secrets.get("AZURE_VISION_ENDPOINT", "")
 VISION_KEY = st.secrets.get("AZURE_VISION_KEY", "")
 
+SPEECH_REGION = st.secrets.get("AZURE_SPEECH_REGION", "")
+SPEECH_KEY = st.secrets.get("AZURE_SPEECH_KEY", "")
+DOCINTEL_ENDPOINT = st.secrets.get("AZURE_DOCINTEL_ENDPOINT", "")
+DOCINTEL_KEY = st.secrets.get("AZURE_DOCINTEL_KEY", "")
 # -----------------------------
 # Telemetry Model
 # -----------------------------
@@ -173,6 +182,115 @@ class AzureLanguageClient(AzureBaseClient):
 
         return response.json(), meta
 
+
+class AzureSpeechClient:
+    """
+    Speech REST integration:
+    - Fast Speech-to-Text (STT)
+    - Text-to-Speech (TTS)
+    - Voices list
+    """
+
+    def __init__(self, region: str, api_key: str, timeout_s: float = 20.0):
+        self.region = region
+        self.api_key = api_key
+        self.timeout_s = timeout_s
+        self.session = requests.Session()
+
+    def fast_transcribe(self, audio_bytes: bytes, locale: str = "en-US") -> dict:
+        # Per Speech-to-text REST docs: /speechtotext/transcriptions:transcribe :contentReference[oaicite:7]{index=7}
+        url = f"https://{self.region}.api.cognitive.microsoft.com/speechtotext/transcriptions:transcribe?api-version=2025-10-15"
+
+        headers = {
+            "Ocp-Apim-Subscription-Key": self.api_key,
+            "Content-Type": "audio/wav",
+            "x-client-request-id": str(uuid.uuid4()),
+        }
+
+        # Body format can evolve; keep it simple. If your tenant requires a JSON wrapper,
+        # we’ll adapt based on the error response.
+        resp = self.session.post(url, headers=headers, data=audio_bytes, timeout=self.timeout_s)
+
+        if not (200 <= resp.status_code < 300):
+            raise AzureServiceError(f"Speech STT error {resp.status_code}: {resp.text[:500]}")
+
+        return resp.json()
+
+    def list_voices(self) -> list[dict]:
+        # Voices list endpoint: https://{region}.tts.speech.microsoft.com/cognitiveservices/voices/list :contentReference[oaicite:8]{index=8}
+        url = f"https://{self.region}.tts.speech.microsoft.com/cognitiveservices/voices/list"
+        headers = {"Ocp-Apim-Subscription-Key": self.api_key}
+        resp = self.session.get(url, headers=headers, timeout=self.timeout_s)
+
+        if not (200 <= resp.status_code < 300):
+            raise AzureServiceError(f"Speech voices error {resp.status_code}: {resp.text[:500]}")
+
+        return resp.json()
+
+    def synthesize(self, ssml: str, output_format: str = "audio-16khz-32kbitrate-mono-mp3") -> bytes:
+        # Typical synth endpoint: /cognitiveservices/v1 (TTS REST) :contentReference[oaicite:9]{index=9}
+        url = f"https://{self.region}.tts.speech.microsoft.com/cognitiveservices/v1"
+        headers = {
+            "Ocp-Apim-Subscription-Key": self.api_key,
+            "Content-Type": "application/ssml+xml",
+            "X-Microsoft-OutputFormat": output_format,
+            "User-Agent": "azure-ai-studio-streamlit",
+        }
+        resp = self.session.post(url, headers=headers, data=ssml.encode("utf-8"), timeout=self.timeout_s)
+
+        if not (200 <= resp.status_code < 300):
+            raise AzureServiceError(f"Speech TTS error {resp.status_code}: {resp.text[:500]}")
+
+        return resp.content
+
+
+class AzureDocIntelClient(AzureBaseClient):
+    """
+    Document Intelligence (v4.0 GA) REST wrapper.
+    Uses async analyze + poll.
+    """
+
+    def analyze_prebuilt_read(self, file_bytes: bytes, content_type: str, api_version: str = "2024-11-30") -> tuple[dict, AzureCallMeta]:
+        submit_url = f"{self.endpoint}/documentintelligence/documentModels/prebuilt-read:analyze?api-version={api_version}"
+
+        # Submit for analysis (returns 202 + Operation-Location) :contentReference[oaicite:11]{index=11}
+        response, meta = self._request(
+            "POST",
+            submit_url,
+            service="DocIntel",
+            operation="prebuilt-read",
+            data=file_bytes,
+            headers={"Content-Type": content_type},
+        )
+
+        if response.status_code != 202:
+            # Some environments might return 200, but 202 is typical for analyze operations.
+            # Still try to parse.
+            return response.json(), meta
+
+        op_location = response.headers.get("Operation-Location")
+        if not op_location:
+            raise AzureServiceError("DocIntel error: missing Operation-Location header.")
+
+        # Poll results
+        for _ in range(30):  # ~30 polls max
+            time.sleep(0.6)
+            poll_resp, poll_meta = self._request(
+                "GET",
+                op_location,
+                service="DocIntel",
+                operation="poll",
+            )
+            data = poll_resp.json()
+            status = data.get("status", "").lower()
+
+            if status in ("succeeded", "failed"):
+                # Return final status + last poll telemetry
+                return data, poll_meta
+
+        raise AzureServiceError("DocIntel polling timed out.")
+
+
 # -----------------------------
 # Caching Layer
 # -----------------------------
@@ -253,8 +371,8 @@ if "telemetry" not in st.session_state:
 # Sidebar
 st.sidebar.header("Services")
 service = st.sidebar.radio(
-    "Select a service:",
-    ["Language Intelligence", "Vision Intelligence", "Speech (Coming Soon)"]
+    "Select a service:",    
+    ["Language Intelligence", "Vision Intelligence", "Speech Services", "Document Intelligence"]
 )
 
 st.sidebar.markdown("---")
@@ -350,7 +468,7 @@ elif service == "Vision Intelligence":
                         uploaded_file.getvalue(),
                         features=["Caption", "Tags", "Objects", "Read"]
                     )
-                    
+
                     st.session_state.telemetry.append(meta)
                     st.caption(f"{meta.status_code} • {meta.elapsed_ms} ms • {meta.request_id}")
 
@@ -390,13 +508,81 @@ elif service == "Vision Intelligence":
                     if "tagsResult" in result:
                         tags = [t["name"] for t in result["tagsResult"]["values"][:8]]
                         st.write(f"**Tags:** {', '.join(tags)}")
-else:
-    st.header("🚧 Coming Soon")
-    st.markdown("""
-    - Vision Intelligence  
-    - Speech Services  
-    - Document Intelligence  
-    """)
+elif service == "Speech Services":
+    st.header("🔊 Speech Services")
+
+    if not SPEECH_REGION or not SPEECH_KEY:
+        st.warning("Speech not configured. Add AZURE_SPEECH_REGION and AZURE_SPEECH_KEY to secrets.")
+    else:
+        speech = AzureSpeechClient(SPEECH_REGION, SPEECH_KEY)
+
+        tab_stt, tab_tts = st.tabs(["📝 Speech to Text", "🗣️ Text to Speech"])
+
+        with tab_stt:
+            st.subheader("Fast transcription (file upload)")
+            audio_file = st.file_uploader("Upload WAV audio", type=["wav"])
+
+            if audio_file and st.button("Transcribe"):
+                try:
+                    with st.spinner("Transcribing..."):
+                        result = speech.fast_transcribe(audio_file.getvalue(), locale="en-US")
+                    st.json(result)
+                except AzureServiceError as e:
+                    st.error(str(e))
+
+        with tab_tts:
+            st.subheader("Synthesize speech")
+            text = st.text_area("Text to speak", value="Hello from Azure AI Speech.")
+            if st.button("Generate Audio"):
+                try:
+                    voices = speech.list_voices()
+                    # Pick a safe default voice if present
+                    default_voice = next((v for v in voices if v.get("ShortName") == "en-US-JennyNeural"), voices[0])
+                    voice_name = default_voice.get("ShortName", "en-US-JennyNeural")
+
+                    ssml = f"""<speak version='1.0' xml:lang='en-US'><voice name='{voice_name}'>{text}</voice></speak>""".strip()
+
+                    audio_bytes = speech.synthesize(ssml)
+                    st.audio(audio_bytes, format="audio/mp3")
+                    st.caption(f"Voice: {voice_name}")
+                except AzureServiceError as e:
+                    st.error(str(e))
+
+elif service == "Document Intelligence":
+    st.header("📄 Document Intelligence")
+
+    if not DOCINTEL_ENDPOINT or not DOCINTEL_KEY:
+        st.warning("Document Intelligence not configured. Add AZURE_DOCINTEL_ENDPOINT and AZURE_DOCINTEL_KEY to secrets.")
+    else:
+        doc = AzureDocIntelClient(DOCINTEL_ENDPOINT, DOCINTEL_KEY)
+
+        up = st.file_uploader("Upload a PDF or image", type=["pdf", "png", "jpg", "jpeg"])
+        if up:
+            mime = up.type or ("application/pdf" if up.name.lower().endswith(".pdf") else "application/octet-stream")
+
+            if st.button("Extract Text (prebuilt-read)"):
+                try:
+                    with st.spinner("Analyzing document..."):
+                        result, meta = doc.analyze_prebuilt_read(up.getvalue(), content_type=mime)
+
+                    st.session_state.telemetry.append(meta)
+                    st.caption(f"{meta.status_code} • {meta.elapsed_ms} ms • {meta.request_id}")
+
+                    # Show extracted content (best-effort)
+                    # Many responses contain content and/or pages/lines depending on model output shape.
+                    if "analyzeResult" in result:
+                        ar = result["analyzeResult"]
+                        content = ar.get("content")
+                        if content:
+                            st.text_area("Extracted text", value=content, height=300)
+                        else:
+                            st.json(result)
+                    else:
+                        st.json(result)
+
+                except AzureServiceError as e:
+                    st.error(str(e))
+
 
 # Footer
 st.markdown("---")
