@@ -2,7 +2,7 @@
 
 Enterprise-grade AI services powered by Azure Cognitive Services.
 
-🔗 **Live Demo:** [https://tvprasad-azure-ai-studio.streamlit.app](https://tvprasad-azure-ai-studio.streamlit.app)
+🔗 **Live Demo:** [https://azure-ai.streamlit.app](https://azure-ai.streamlit.app)
 
 ## Features
 
